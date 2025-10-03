@@ -1,0 +1,4 @@
+[flake8]
+per-file-ignores =
+    cli\comfy_rmbg.py: E501
+    cli\comfy_upscale.py: E501
