@@ -289,6 +289,8 @@ async def download_url_to_file_3d(
     )
 
     if task_id is not None:
+        # This is only for backward compatability with current behavior when every 3D node is output node
+        # All new API nodes should not use "task_id" and instead users should use "SaveGLB" node to save results
         output_dir = Path(get_output_directory())
         output_path = output_dir / f"{task_id}.{file_format}"
         output_path.write_bytes(data.getvalue())
