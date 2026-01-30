@@ -1011,11 +1011,17 @@ async def validate_prompt(prompt_id, prompt, partial_execution_list: Union[list[
         class_type = prompt[x]['class_type']
         class_ = nodes.NODE_CLASS_MAPPINGS.get(class_type, None)
         if class_ is None:
+            node_data = prompt[x]
+            node_title = node_data.get('_meta', {}).get('title', class_type)
             error = {
-                "type": "invalid_prompt",
-                "message": f"Cannot execute because node {class_type} does not exist.",
+                "type": "missing_node_type",
+                "message": f"Node '{node_title}' not found. The custom node may not be installed.",
                 "details": f"Node ID '#{x}'",
-                "extra_info": {}
+                "extra_info": {
+                    "node_id": x,
+                    "class_type": class_type,
+                    "node_title": node_title
+                }
             }
             return (False, error, [], {})
 
