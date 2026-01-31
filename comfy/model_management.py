@@ -22,10 +22,10 @@ from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 import torch
 import sys
-import importlib
 import platform
 import weakref
 import gc
+import os
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -89,6 +89,7 @@ if args.deterministic:
 
 directml_enabled = False
 if args.directml is not None:
+    logging.warning("WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options.")
     import torch_directml
     directml_enabled = True
     device_index = args.directml
@@ -330,25 +331,47 @@ except:
 
 
 SUPPORT_FP8_OPS = args.supports_fp8_compute
+
+AMD_RDNA2_AND_OLDER_ARCH = ["gfx1030", "gfx1031", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]
+AMD_ENABLE_MIOPEN_ENV = 'COMFYUI_ENABLE_MIOPEN'
+
 try:
     if is_amd():
+        arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName
+        if not (any((a in arch) for a in AMD_RDNA2_AND_OLDER_ARCH)):
+            if os.getenv(AMD_ENABLE_MIOPEN_ENV) != '1':
+                torch.backends.cudnn.enabled = False  # Seems to improve things a lot on AMD
+                logging.info("Set: torch.backends.cudnn.enabled = False for better AMD performance.")
+
         try:
             rocm_version = tuple(map(int, str(torch.version.hip).split(".")[:2]))
         except:
             rocm_version = (6, -1)
-        arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName
+
+        def aotriton_supported(gpu_arch):
+            path = torch.__path__[0]
+            path = os.path.join(os.path.join(path, "lib"), "aotriton.images")
+            gfx = set(map(lambda a: a[4:], filter(lambda a: a.startswith("amd-gfx"), os.listdir(path))))
+            if gpu_arch in gfx:
+                return True
+            if "{}x".format(gpu_arch[:-1]) in gfx:
+                return True
+            if "{}xx".format(gpu_arch[:-2]) in gfx:
+                return True
+            return False
+
         logging.info("AMD arch: {}".format(arch))
         logging.info("ROCm version: {}".format(rocm_version))
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
-            if importlib.util.find_spec('triton') is not None:  # AMD efficient attention implementation depends on triton. TODO: better way of detecting if it's compiled in or not.
+            if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
                     if any((a in arch) for a in ["gfx90a", "gfx942", "gfx1100", "gfx1101", "gfx1151"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
-#                if torch_version_numeric >= (2, 8):
-#                    if any((a in arch) for a in ["gfx1201"]):
-#                        ENABLE_PYTORCH_ATTENTION = True
+                if rocm_version >= (7, 0):
+                   if any((a in arch) for a in ["gfx1200", "gfx1201"]):
+                       ENABLE_PYTORCH_ATTENTION = True
         if torch_version_numeric >= (2, 7) and rocm_version >= (6, 4):
-            if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx942", "gfx950"]):  # TODO: more arches
+            if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx950"]):  # TODO: more arches, "gfx942" gives error on pytorch nightly 2.10 1013 rocm7.0
                 SUPPORT_FP8_OPS = True
 
 except:
@@ -369,6 +392,9 @@ try:
         logging.info("Enabled fp16 accumulation.")
 except:
     pass
+
+if torch.cuda.is_available() and torch.backends.cudnn.is_available() and PerformanceFeature.AutoTune in args.fast:
+    torch.backends.cudnn.benchmark = True
 
 try:
     if torch_version_numeric >= (2, 5):
@@ -441,7 +467,7 @@ def module_size(module):
     sd = module.state_dict()
     for k in sd:
         t = sd[k]
-        module_mem += t.nelement() * t.element_size()
+        module_mem += t.nbytes
     return module_mem
 
 class LoadedModel:
@@ -492,6 +518,7 @@ class LoadedModel:
         if use_more_vram == 0:
             use_more_vram = 1e32
         self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
+
         real_model = self.model.model
 
         if is_intel_xpu() and not args.disable_ipex_optimize and 'ipex' in globals() and real_model is not None:
@@ -676,8 +703,11 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             loaded_memory = loaded_model.model_loaded_memory()
             current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
-            lowvram_model_memory = max(128 * 1024 * 1024, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
-            lowvram_model_memory = max(0.1, lowvram_model_memory - loaded_memory)
+            lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
+            lowvram_model_memory = lowvram_model_memory - loaded_memory
+
+            if lowvram_model_memory == 0:
+                lowvram_model_memory = 0.1
 
         if vram_set_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
@@ -925,11 +955,7 @@ def vae_dtype(device=None, allowed_dtypes=[]):
         if d == torch.float16 and should_use_fp16(device):
             return d
 
-        # NOTE: bfloat16 seems to work on AMD for the VAE but is extremely slow in some cases compared to fp32
-        # slowness still a problem on pytorch nightly 2.9.0.dev20250720+rocm6.4 tested on RDNA3
-        # also a problem on RDNA4 except fp32 is also slow there.
-        # This is due to large bf16 convolutions being extremely slow.
-        if d == torch.bfloat16 and ((not is_amd()) or amd_min_version(device, min_rdna_version=4)) and should_use_bf16(device):
+        if d == torch.bfloat16 and should_use_bf16(device):
             return d
 
     return torch.float32
@@ -991,12 +1017,6 @@ def device_supports_non_blocking(device):
         return False
     return True
 
-def device_should_use_non_blocking(device):
-    if not device_supports_non_blocking(device):
-        return False
-    return False
-    # return True #TODO: figure out why this causes memory issues on Nvidia and possibly others
-
 def force_channels_last():
     if args.force_channels_last:
         return True
@@ -1006,54 +1026,72 @@ def force_channels_last():
 
 
 STREAMS = {}
-NUM_STREAMS = 1
-if args.async_offload:
-    NUM_STREAMS = 2
+NUM_STREAMS = 0
+if args.async_offload is not None:
+    NUM_STREAMS = args.async_offload
+else:
+    #  Enable by default on Nvidia and AMD
+    if is_nvidia() or is_amd():
+        NUM_STREAMS = 2
+
+if args.disable_async_offload:
+    NUM_STREAMS = 0
+
+if NUM_STREAMS > 0:
     logging.info("Using async weight offloading with {} streams".format(NUM_STREAMS))
+
+def current_stream(device):
+    if device is None:
+        return None
+    if is_device_cuda(device):
+        return torch.cuda.current_stream()
+    elif is_device_xpu(device):
+        return torch.xpu.current_stream()
+    else:
+        return None
 
 stream_counters = {}
 def get_offload_stream(device):
     stream_counter = stream_counters.get(device, 0)
-    if NUM_STREAMS <= 1:
+    if NUM_STREAMS == 0:
+        return None
+
+    if torch.compiler.is_compiling():
         return None
 
     if device in STREAMS:
         ss = STREAMS[device]
-        s = ss[stream_counter]
+        #Sync the oldest stream in the queue with the current
+        ss[stream_counter].wait_stream(current_stream(device))
         stream_counter = (stream_counter + 1) % len(ss)
-        if is_device_cuda(device):
-            ss[stream_counter].wait_stream(torch.cuda.current_stream())
-        elif is_device_xpu(device):
-            ss[stream_counter].wait_stream(torch.xpu.current_stream())
         stream_counters[device] = stream_counter
-        return s
+        return ss[stream_counter]
     elif is_device_cuda(device):
         ss = []
         for k in range(NUM_STREAMS):
-            ss.append(torch.cuda.Stream(device=device, priority=0))
+            s1 = torch.cuda.Stream(device=device, priority=0)
+            s1.as_context = torch.cuda.stream
+            ss.append(s1)
         STREAMS[device] = ss
         s = ss[stream_counter]
-        stream_counter = (stream_counter + 1) % len(ss)
         stream_counters[device] = stream_counter
         return s
     elif is_device_xpu(device):
         ss = []
         for k in range(NUM_STREAMS):
-            ss.append(torch.xpu.Stream(device=device, priority=0))
+            s1 = torch.xpu.Stream(device=device, priority=0)
+            s1.as_context = torch.xpu.stream
+            ss.append(s1)
         STREAMS[device] = ss
         s = ss[stream_counter]
-        stream_counter = (stream_counter + 1) % len(ss)
         stream_counters[device] = stream_counter
         return s
     return None
 
 def sync_stream(device, stream):
-    if stream is None:
+    if stream is None or current_stream(device) is None:
         return
-    if is_device_cuda(device):
-        torch.cuda.current_stream().wait_stream(stream)
-    elif is_device_xpu(device):
-        torch.xpu.current_stream().wait_stream(stream)
+    current_stream(device).wait_stream(stream)
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is None or weight.device == device:
@@ -1061,12 +1099,19 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
             if dtype is None or weight.dtype == dtype:
                 return weight
         if stream is not None:
-            with stream:
+            wf_context = stream
+            if hasattr(wf_context, "as_context"):
+                wf_context = wf_context.as_context(stream)
+            with wf_context:
                 return weight.to(dtype=dtype, copy=copy)
         return weight.to(dtype=dtype, copy=copy)
 
+
     if stream is not None:
-        with stream:
+        wf_context = stream
+        if hasattr(wf_context, "as_context"):
+            wf_context = wf_context.as_context(stream)
+        with wf_context:
             r = torch.empty_like(weight, dtype=dtype, device=device)
             r.copy_(weight, non_blocking=non_blocking)
     else:
@@ -1077,6 +1122,99 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
 def cast_to_device(tensor, device, dtype, copy=False):
     non_blocking = device_supports_non_blocking(device)
     return cast_to(tensor, dtype=dtype, device=device, non_blocking=non_blocking, copy=copy)
+
+
+PINNED_MEMORY = {}
+TOTAL_PINNED_MEMORY = 0
+MAX_PINNED_MEMORY = -1
+if not args.disable_pinned_memory:
+    if is_nvidia() or is_amd():
+        if WINDOWS:
+            MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * 0.45  # Windows limit is apparently 50%
+        else:
+            MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * 0.95
+        logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
+
+PINNING_ALLOWED_TYPES = set(["Parameter", "QuantizedTensor"])
+
+def discard_cuda_async_error():
+    try:
+        a = torch.tensor([1], dtype=torch.uint8, device=get_torch_device())
+        b = torch.tensor([1], dtype=torch.uint8, device=get_torch_device())
+        _ = a + b
+        torch.cuda.synchronize()
+    except torch.AcceleratorError:
+        #Dump it! We already know about it from the synchronous return
+        pass
+
+def pin_memory(tensor):
+    global TOTAL_PINNED_MEMORY
+    if MAX_PINNED_MEMORY <= 0:
+        return False
+
+    if type(tensor).__name__ not in PINNING_ALLOWED_TYPES:
+        return False
+
+    if not is_device_cpu(tensor.device):
+        return False
+
+    if tensor.is_pinned():
+        #NOTE: Cuda does detect when a tensor is already pinned and would
+        #error below, but there are proven cases where this also queues an error
+        #on the GPU async. So dont trust the CUDA API and guard here
+        return False
+
+    if not tensor.is_contiguous():
+        return False
+
+    size = tensor.nbytes
+    if (TOTAL_PINNED_MEMORY + size) > MAX_PINNED_MEMORY:
+        return False
+
+    ptr = tensor.data_ptr()
+    if ptr == 0:
+        return False
+
+    if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
+        PINNED_MEMORY[ptr] = size
+        TOTAL_PINNED_MEMORY += size
+        return True
+    else:
+        logging.warning("Pin error.")
+        discard_cuda_async_error()
+
+    return False
+
+def unpin_memory(tensor):
+    global TOTAL_PINNED_MEMORY
+    if MAX_PINNED_MEMORY <= 0:
+        return False
+
+    if not is_device_cpu(tensor.device):
+        return False
+
+    ptr = tensor.data_ptr()
+    size = tensor.nbytes
+
+    size_stored = PINNED_MEMORY.get(ptr, None)
+    if size_stored is None:
+        logging.warning("Tried to unpin tensor not pinned by ComfyUI")
+        return False
+
+    if size != size_stored:
+        logging.warning("Size of pinned tensor changed")
+        return False
+
+    if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
+        TOTAL_PINNED_MEMORY -= PINNED_MEMORY.pop(ptr)
+        if len(PINNED_MEMORY) == 0:
+            TOTAL_PINNED_MEMORY = 0
+        return True
+    else:
+        logging.warning("Unpin error.")
+        discard_cuda_async_error()
+
+    return False
 
 def sage_attention_enabled():
     return args.use_sage_attention
@@ -1330,7 +1468,7 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 
     if is_amd():
         arch = torch.cuda.get_device_properties(device).gcnArchName
-        if any((a in arch) for a in ["gfx1030", "gfx1031", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]):  # RDNA2 and older don't support bf16
+        if any((a in arch) for a in AMD_RDNA2_AND_OLDER_ARCH):  # RDNA2 and older don't support bf16
             if manual_cast:
                 return True
             return False
@@ -1377,12 +1515,36 @@ def supports_fp8_compute(device=None):
 
     return True
 
+def supports_nvfp4_compute(device=None):
+    if not is_nvidia():
+        return False
+
+    props = torch.cuda.get_device_properties(device)
+    if props.major < 10:
+        return False
+
+    return True
+
 def extended_fp16_support():
     # TODO: check why some models work with fp16 on newer torch versions but not on older
     if torch_version_numeric < (2, 7):
         return False
 
     return True
+
+LORA_COMPUTE_DTYPES = {}
+def lora_compute_dtype(device):
+    dtype = LORA_COMPUTE_DTYPES.get(device, None)
+    if dtype is not None:
+        return dtype
+
+    if should_use_fp16(device):
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
+    LORA_COMPUTE_DTYPES[device] = dtype
+    return dtype
 
 def soft_empty_cache(force=False):
     global cpu_state
@@ -1401,6 +1563,10 @@ def soft_empty_cache(force=False):
 def unload_all_models():
     free_memory(1e30, get_torch_device())
 
+def debug_memory_summary():
+    if is_amd() or is_nvidia():
+        return torch.cuda.memory.memory_summary()
+    return ""
 
 #TODO: might be cleaner to put this somewhere else
 import threading
