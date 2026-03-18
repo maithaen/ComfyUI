@@ -716,12 +716,12 @@ def _render_shader_batch(
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
         gl.glUseProgram(0)
 
-        if input_textures:
-            gl.glDeleteTextures(len(input_textures), input_textures)
-        if output_textures:
-            gl.glDeleteTextures(len(output_textures), output_textures)
-        if ping_pong_textures:
-            gl.glDeleteTextures(len(ping_pong_textures), ping_pong_textures)
+        for tex in input_textures:
+            gl.glDeleteTextures(int(tex))
+        for tex in output_textures:
+            gl.glDeleteTextures(int(tex))
+        for tex in ping_pong_textures:
+            gl.glDeleteTextures(int(tex))
         if fbo is not None:
             gl.glDeleteFramebuffers(1, [fbo])
         for pp_fbo in ping_pong_fbos:
@@ -865,14 +865,15 @@ class GLSLShader(io.ComfyNode):
         cls, image_list: list[torch.Tensor], output_batch: torch.Tensor
     ) -> dict[str, list]:
         """Build UI output with input and output images for client-side shader execution."""
-        combined_inputs = torch.cat(image_list, dim=0)
-        input_images_ui = ui.ImageSaveHelper.save_images(
-            combined_inputs,
-            filename_prefix="GLSLShader_input",
-            folder_type=io.FolderType.temp,
-            cls=None,
-            compress_level=1,
-        )
+        input_images_ui = []
+        for img in image_list:
+            input_images_ui.extend(ui.ImageSaveHelper.save_images(
+                img,
+                filename_prefix="GLSLShader_input",
+                folder_type=io.FolderType.temp,
+                cls=None,
+                compress_level=1,
+            ))
 
         output_images_ui = ui.ImageSaveHelper.save_images(
             output_batch,

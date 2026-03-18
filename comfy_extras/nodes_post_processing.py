@@ -21,6 +21,7 @@ class Blend(io.ComfyNode):
             node_id="ImageBlend",
             display_name="Image Blend",
             category="image/postprocessing",
+            essentials_category="Image Tools",
             inputs=[
                 io.Image.Input("image1"),
                 io.Image.Input("image2"),
@@ -79,7 +80,6 @@ class Blur(io.ComfyNode):
             node_id="ImageBlur",
             display_name="Image Blur",
             category="image/postprocessing",
-            essentials_category="Image Tools",
             inputs=[
                 io.Image.Input("image"),
                 io.Int.Input("blur_radius", default=1, min=1, max=31, step=1),
@@ -568,6 +568,7 @@ class BatchImagesNode(io.ComfyNode):
             node_id="BatchImagesNode",
             display_name="Batch Images",
             category="image",
+            essentials_category="Image Tools",
             search_aliases=["batch", "image batch", "batch images", "combine images", "merge images", "stack images"],
             inputs=[
                 io.Autogrow.Input("images", template=autogrow_template)
